@@ -6,14 +6,12 @@
  * on any external proxy service.
  *
  * Supported scenarios:
- *   /cache/**                         → cdn.winget.microsoft.com (winget source index + manifests)
- *   /github.com/**                    → github.com (installer downloads)
- *   /objects.githubusercontent.com/** → objects.githubusercontent.com
- *   /raw.githubusercontent.com/**     → raw.githubusercontent.com
- *   /codeload.github.com/**           → codeload.github.com
+ *   /cache/**            → cdn.winget.microsoft.com (winget source index + manifests)
+ *   /<hostname>/**       → https://<hostname>/... (generic installer download proxy)
  *
  * URL rewriting in manifest YAML:
- *   InstallerUrl pointing to GitHub → rewritten to /github.com/... on this worker
+ *   ALL InstallerUrl values rewritten to go through this worker:
+ *   https://some.host/path → proxyBase/some.host/path
  *
  * Usage as a winget custom source:
  *   winget source add --name winget-cn \
@@ -23,13 +21,8 @@
 
 const UPSTREAM_BASE = "https://cdn.winget.microsoft.com";
 
-// GitHub domains proxied through this worker (path prefix → upstream base URL)
-const GITHUB_UPSTREAM: Record<string, string> = {
-  "github.com":                  "https://github.com",
-  "objects.githubusercontent.com": "https://objects.githubusercontent.com",
-  "raw.githubusercontent.com":   "https://raw.githubusercontent.com",
-  "codeload.github.com":         "https://codeload.github.com",
-};
+// Regex: matches a path segment that looks like a hostname (contains at least one dot)
+const DOMAIN_PREFIX_RE = /^\/([a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9][a-zA-Z0-9-]*)+)(\/.*)?$/;
 
 const HOP_BY_HOP = new Set([
   "host", "connection", "keep-alive", "proxy-authenticate",
@@ -54,29 +47,28 @@ function buildResponseHeaders(incoming: Headers): Headers {
 }
 
 /**
- * Rewrite GitHub download URLs in manifest YAML to go through this worker.
- * The proxy base is the same host the request came in on, so no external dependency.
+ * Rewrite ALL InstallerUrl values in manifest YAML to route through this worker.
+ * Matches any https:// URL on an InstallerUrl line and rewrites it to
+ * proxyBase/<host>/<path>, regardless of the download host.
  */
 function rewriteManifestUrls(yaml: string, proxyBase: string): string {
-  return yaml
-    .replaceAll("https://github.com/",                  `${proxyBase}/github.com/`)
-    .replaceAll("https://objects.githubusercontent.com/", `${proxyBase}/objects.githubusercontent.com/`)
-    .replaceAll("https://raw.githubusercontent.com/",   `${proxyBase}/raw.githubusercontent.com/`)
-    .replaceAll("https://codeload.github.com/",         `${proxyBase}/codeload.github.com/`);
+  return yaml.replace(
+    /^(\s*InstallerUrl:\s+)https?:\/\/([^/\s]+)(\/\S*)/gm,
+    (_, prefix, host, path) => `${prefix}${proxyBase}/${host}${path}`
+  );
 }
 
 /**
- * If the path starts with a known GitHub host prefix (e.g. /github.com/...),
+ * If the path starts with a domain-like prefix (e.g. /download.sublimetext.com/...),
  * return the upstream URL to proxy to. Otherwise return null.
+ * A domain must contain at least one dot; plain words like /cache never match.
  */
-function getGithubUpstream(pathname: string): string | null {
-  for (const [host, base] of Object.entries(GITHUB_UPSTREAM)) {
-    const prefix = `/${host}/`;
-    if (pathname.startsWith(prefix)) {
-      return `${base}${pathname.slice(prefix.length - 1)}`; // keep leading /
-    }
-  }
-  return null;
+function getProxyUpstream(pathname: string): string | null {
+  const m = DOMAIN_PREFIX_RE.exec(pathname);
+  if (!m) return null;
+  const host = m[1];
+  const rest = m[2] ?? "/";
+  return `https://${host}${rest}`;
 }
 
 /**
@@ -91,10 +83,17 @@ function isManifestPath(pathname: string): boolean {
 async function proxyRequest(request: Request, targetUrl: string, proxyBase: string): Promise<Response> {
   const reqHeaders = buildRequestHeaders(request.headers);
 
+  // For manifest paths we follow redirects (small text files, need body).
+  // For all other requests (binary downloads) we use manual redirect so we can
+  // rewrite the Location header and let the client re-follow through the proxy —
+  // this avoids the worker having to stream large files twice.
+  const isManifest = isManifestPath(new URL(targetUrl).pathname);
+
   const upstreamReq = new Request(targetUrl, {
     method: request.method,
     headers: reqHeaders,
     body: ["GET", "HEAD"].includes(request.method) ? null : request.body,
+    redirect: isManifest ? "follow" : "manual",
     // @ts-ignore — Workers-specific duplex hint for streaming bodies
     duplex: "half",
   });
@@ -109,6 +108,22 @@ async function proxyRequest(request: Request, targetUrl: string, proxyBase: stri
   const respHeaders = buildResponseHeaders(upstream.headers);
   const contentType = upstream.headers.get("content-type") ?? "";
   const pathname = new URL(targetUrl).pathname;
+
+  // Intercept 3xx redirects: rewrite Location to stay within the proxy
+  if (upstream.status >= 300 && upstream.status < 400) {
+    const location = upstream.headers.get("location");
+    if (location) {
+      try {
+        const loc = new URL(location, targetUrl); // resolve relative URLs
+        if (loc.protocol === "https:" || loc.protocol === "http:") {
+          respHeaders.set("location", `${proxyBase}/${loc.host}${loc.pathname}${loc.search}${loc.hash}`);
+        }
+      } catch {
+        // unparseable location — leave as-is
+      }
+    }
+    return new Response(null, { status: upstream.status, statusText: upstream.statusText, headers: respHeaders });
+  }
 
   // For manifest YAML files: buffer and rewrite installer URLs to go through this worker
   if (
@@ -304,11 +319,8 @@ winget upgrade --all</pre>
       <tbody>
         <tr><td><code>/cache/source.msix</code></td><td><code>cdn.winget.microsoft.com</code></td><td>完整包索引下载（透明代理）</td></tr>
         <tr><td><code>/cache/source2.msix</code></td><td><code>cdn.winget.microsoft.com</code></td><td>增量包索引下载（透明代理）</td></tr>
-        <tr><td><code>/cache/manifests/**</code></td><td><code>cdn.winget.microsoft.com</code></td><td>包清单 YAML（InstallerUrl 重写加速）</td></tr>
-        <tr><td><code>/github.com/**</code></td><td><code>github.com</code></td><td>GitHub Release 安装器下载</td></tr>
-        <tr><td><code>/objects.githubusercontent.com/**</code></td><td><code>objects.githubusercontent.com</code></td><td>GitHub 对象存储下载</td></tr>
-        <tr><td><code>/raw.githubusercontent.com/**</code></td><td><code>raw.githubusercontent.com</code></td><td>GitHub Raw 文件</td></tr>
-        <tr><td><code>/codeload.github.com/**</code></td><td><code>codeload.github.com</code></td><td>GitHub 代码包下载</td></tr>
+        <tr><td><code>/cache/manifests/**</code></td><td><code>cdn.winget.microsoft.com</code></td><td>包清单 YAML（所有 InstallerUrl 重写加速）</td></tr>
+        <tr><td><code>/&lt;hostname&gt;/**</code></td><td><code>https://&lt;hostname&gt;</code></td><td>通用安装器下载代理（任意域名）</td></tr>
       </tbody>
     </table>
   </div>
@@ -345,10 +357,10 @@ export default {
 
     const proxyBase = `${url.protocol}//${url.host}`;
 
-    // GitHub download proxy: /github.com/**, /objects.githubusercontent.com/**, etc.
-    const githubTarget = getGithubUpstream(pathname);
-    if (githubTarget) {
-      return proxyRequest(request, `${githubTarget}${search}`, proxyBase);
+    // Generic download proxy: /<hostname>/path → https://<hostname>/path
+    const proxyTarget = getProxyUpstream(pathname);
+    if (proxyTarget) {
+      return proxyRequest(request, `${proxyTarget}${search}`, proxyBase);
     }
 
     // Everything else: proxy to upstream winget CDN

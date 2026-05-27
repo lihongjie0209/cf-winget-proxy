@@ -28,7 +28,9 @@ import * as jsyaml from "js-yaml";
 
 const UPSTREAM_CDN = "https://cdn.winget.microsoft.com";
 const WINGET_PKGS_API = "https://api.github.com/repos/microsoft/winget-pkgs";
-const WINGET_PKGS_RAW = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master";
+// YAML manifest files are fetched from Microsoft CDN (same path structure as GitHub repo,
+// no GitHub API rate limits, more reliable for China)
+const WINGET_PKGS_MANIFEST_BASE = "https://cdn.winget.microsoft.com/cache";
 
 // Domain-like path prefix: /download.example.com/path  (requires at least one dot)
 const DOMAIN_PREFIX_RE = /^\/([a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9][a-zA-Z0-9-]*)+)(\/.*)?$/;
@@ -122,6 +124,8 @@ async function proxyRequest(
 }
 
 // ─── GitHub helper ────────────────────────────────────────────────────────────
+// Only used for directory listing (version enumeration). Responses are cached
+// at the CF edge for 30 minutes to stay well within the 60 req/hr rate limit.
 
 async function ghFetch(url: string, env: Env): Promise<Response> {
   const headers: Record<string, string> = {
@@ -129,7 +133,11 @@ async function ghFetch(url: string, env: Env): Promise<Response> {
     Accept: "application/vnd.github.v3+json",
   };
   if (env.GITHUB_TOKEN) headers["Authorization"] = `token ${env.GITHUB_TOKEN}`;
-  return fetch(url, { headers });
+  return fetch(url, {
+    headers,
+    // @ts-ignore: CF Workers cf option for edge-level caching
+    cf: { cacheEverything: true, cacheTtl: 1800 },
+  });
 }
 
 // ─── Package ID helpers ───────────────────────────────────────────────────────
@@ -305,20 +313,24 @@ async function handlePackageManifest(
   }
 
   const versionPath = `${basePath}/${version}`;
-  const rawBase = `${WINGET_PKGS_RAW}/${versionPath}`;
+  const cdnBase = `${WINGET_PKGS_MANIFEST_BASE}/${versionPath}`;
 
-  // Fetch installer YAML (multi-file manifest), fall back to single-file
-  const installerUrl = `${rawBase}/${id}.installer.yaml`;
+  // Fetch installer YAML from Microsoft CDN (same path as GitHub, no API rate limits)
+  const installerUrl = `${cdnBase}/${id}.installer.yaml`;
   let installerResp = await fetch(installerUrl, {
     headers: { "User-Agent": "winget-cn-proxy/2.0" },
+    // @ts-ignore
+    cf: { cacheEverything: true, cacheTtl: 3600 },
   });
   let installerYaml: string;
 
   if (installerResp.ok) {
     installerYaml = await installerResp.text();
   } else {
-    const singleResp = await fetch(`${rawBase}/${id}.yaml`, {
+    const singleResp = await fetch(`${cdnBase}/${id}.yaml`, {
       headers: { "User-Agent": "winget-cn-proxy/2.0" },
+      // @ts-ignore
+      cf: { cacheEverything: true, cacheTtl: 3600 },
     });
     if (!singleResp.ok) {
       return Response.json(
@@ -330,8 +342,10 @@ async function handlePackageManifest(
   }
 
   // Fetch locale YAML for display metadata
-  const localeResp = await fetch(`${rawBase}/${id}.locale.en-US.yaml`, {
+  const localeResp = await fetch(`${cdnBase}/${id}.locale.en-US.yaml`, {
     headers: { "User-Agent": "winget-cn-proxy/2.0" },
+    // @ts-ignore
+    cf: { cacheEverything: true, cacheTtl: 3600 },
   });
   const localeYaml = localeResp.ok ? await localeResp.text() : null;
 

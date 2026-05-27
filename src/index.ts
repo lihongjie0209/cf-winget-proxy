@@ -65,10 +65,9 @@ function rewriteManifestUrls(yaml: string): string {
  * These are small text files (few KB) safe to buffer and rewrite.
  */
 function isManifestPath(pathname: string): boolean {
-  // Match paths like /manifests/g/Git/Git/2.54.0/1e1a
+  // Match paths like /cache/manifests/g/Git/Git/2.54.0/1e1a
   // The last segment is a short hex string (typically 4 chars)
-  const parts = pathname.split("/").filter(Boolean);
-  return parts.length >= 6 && parts[0] === "manifests";
+  return pathname.includes("/manifests/");
 }
 
 async function proxyRequest(request: Request, targetUrl: string): Promise<Response> {

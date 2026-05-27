@@ -146,11 +146,14 @@ function parsePackageId(id: string): PkgPath {
   const dot = id.indexOf(".");
   const publisher = dot >= 0 ? id.slice(0, dot) : id;
   const packageRest = dot >= 0 ? id.slice(dot + 1) : "";
+  // Directory path: all dots in the package portion become slashes
+  // e.g. SublimeHQ.SublimeText.4 → manifests/s/SublimeHQ/SublimeText/4
+  const packageDirPath = packageRest.replace(/\./g, "/");
   return {
     firstLetter,
     publisher,
     packageRest,
-    basePath: `manifests/${firstLetter}/${publisher}/${packageRest}`,
+    basePath: `manifests/${firstLetter}/${publisher}/${packageDirPath}`,
   };
 }
 

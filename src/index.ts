@@ -200,6 +200,9 @@ async function handleManifestSearch(
     return Response.json({ Data: [] });
   }
 
+  // Debug: log exact request body from winget
+  console.log("manifestSearch body:", JSON.stringify(body));
+
   const filters: any[] = body?.Filters ?? [];
   const inclusions: any[] = body?.Inclusions ?? [];
   const query = body?.Query;
@@ -226,7 +229,7 @@ async function handleManifestSearch(
         .map((e) => e.name)
         .sort((a, b) => compareVersions(b, a));
       if (versions.length > 0) {
-        return Response.json({
+        const result = {
           Data: [
             {
               PackageIdentifier: id,
@@ -235,9 +238,12 @@ async function handleManifestSearch(
               Versions: versions.slice(0, 10).map((v) => ({ PackageVersion: v })),
             },
           ],
-        });
+        };
+        console.log("manifestSearch response:", JSON.stringify(result));
+        return Response.json(result);
       }
     }
+    console.log("manifestSearch: package not found for id:", id);
     return Response.json({ Data: [] });
   }
 

@@ -208,49 +208,58 @@ async function handleManifestSearch(
   const query = body?.Query;
   const maxResults: number = body?.MaximumResults ?? 20;
 
-  // ── Case 1: exact PackageIdentifier match (winget uses Inclusions for `winget install`)
+  // ── Helper: look up a package ID in winget-pkgs and return a Data entry ────
+  async function lookupPackageId(id: string): Promise<object | null> {
+    const { basePath, publisher, packageRest } = parsePackageId(id);
+    const resp = await ghFetch(`${WINGET_PKGS_API}/contents/${basePath}`, env);
+    if (!resp.ok) return null;
+    const entries = (await resp.json()) as any[];
+    const versions = entries
+      .filter((e) => e.type === "dir")
+      .map((e) => e.name)
+      .sort((a, b) => compareVersions(b, a));
+    if (versions.length === 0) return null;
+    return {
+      PackageIdentifier: id,
+      PackageName: packageRest.replace(/\./g, " "),
+      Publisher: publisher,
+      Versions: versions.slice(0, 10).map((v) => ({ PackageVersion: v })),
+    };
+  }
+
+  // ── Case 1: PackageIdentifier filter/inclusion (winget install sends Filters+CaseInsensitive)
   const allCriteria = [...filters, ...inclusions];
-  const exactIdFilter = allCriteria.find(
+  const idFilter = allCriteria.find(
     (f) =>
       f.PackageMatchField === "PackageIdentifier" &&
-      f.RequestMatch?.MatchType === "Exact"
+      (f.RequestMatch?.MatchType === "Exact" ||
+        f.RequestMatch?.MatchType === "CaseInsensitive")
   );
-  if (exactIdFilter) {
-    const id: string = exactIdFilter.RequestMatch.KeyWord;
-    const { basePath, publisher, packageRest } = parsePackageId(id);
-    const resp = await ghFetch(
-      `${WINGET_PKGS_API}/contents/${basePath}`,
-      env
-    );
-    if (resp.ok) {
-      const entries = (await resp.json()) as any[];
-      const versions = entries
-        .filter((e) => e.type === "dir")
-        .map((e) => e.name)
-        .sort((a, b) => compareVersions(b, a));
-      if (versions.length > 0) {
-        const result = {
-          Data: [
-            {
-              PackageIdentifier: id,
-              PackageName: packageRest.replace(/\./g, " "),
-              Publisher: publisher,
-              Versions: versions.slice(0, 10).map((v) => ({ PackageVersion: v })),
-            },
-          ],
-        };
-        console.log("manifestSearch response:", JSON.stringify(result));
-        return Response.json(result);
-      }
+  if (idFilter) {
+    const id: string = idFilter.RequestMatch.KeyWord;
+    console.log("manifestSearch: looking up package id:", id);
+    const entry = await lookupPackageId(id);
+    if (entry) {
+      const result = { Data: [entry] };
+      console.log("manifestSearch response:", JSON.stringify(result));
+      return Response.json(result);
     }
     console.log("manifestSearch: package not found for id:", id);
     return Response.json({ Data: [] });
   }
 
-  // ── Case 2: keyword search ────────────────────────────────────────────────
+  // ── Case 2: keyword search via Query ─────────────────────────────────────
   const keyword: string | undefined = query?.KeyWord;
   if (keyword) {
-    // GitHub code search (10 rpm unauthenticated, 30 rpm with token)
+    // If keyword looks like a PackageIdentifier (Publisher.Package), try direct lookup first
+    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9._-]+$/.test(keyword)) {
+      const entry = await lookupPackageId(keyword);
+      if (entry) {
+        return Response.json({ Data: [entry] });
+      }
+    }
+
+    // Fall back to GitHub code search (rate-limited: 10/min unauthenticated)
     const searchUrl =
       `https://api.github.com/search/code` +
       `?q=${encodeURIComponent(keyword)}+repo:microsoft/winget-pkgs+path:manifests` +
@@ -599,6 +608,11 @@ export default {
     // ── Microsoft.Rest API endpoints ────────────────────────────────────────
     if (pathname === "/information" && request.method === "GET") {
       return handleInformation();
+    }
+    // Debug: echo request body back (temporary, for diagnosing winget request format)
+    if (pathname === "/debug/echo" && request.method === "POST") {
+      const body = await request.text();
+      return new Response(body, { headers: { "content-type": "application/json" } });
     }
     if (pathname === "/manifestSearch" && request.method === "POST") {
       return handleManifestSearch(request, env);

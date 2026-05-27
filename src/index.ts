@@ -2,16 +2,18 @@
  * Winget Source Proxy Worker
  *
  * Proxies cdn.winget.microsoft.com to accelerate Windows Package Manager
- * source index downloads from China.
+ * source index downloads from China. Fully self-contained — does not depend
+ * on any external proxy service.
  *
  * Supported scenarios:
- *   /source.msix          → source index download (pass-through)
- *   /source2.msix         → source2 index download (pass-through)
- *   /manifests/**         → V1 merged manifest YAML files with InstallerUrl rewriting
+ *   /cache/**                         → cdn.winget.microsoft.com (winget source index + manifests)
+ *   /github.com/**                    → github.com (installer downloads)
+ *   /objects.githubusercontent.com/** → objects.githubusercontent.com
+ *   /raw.githubusercontent.com/**     → raw.githubusercontent.com
+ *   /codeload.github.com/**           → codeload.github.com
  *
  * URL rewriting in manifest YAML:
- *   github.com releases   → gh.cn.lihongjie.cn
- *   objects.githubusercontent.com → gh.cn.lihongjie.cn/objects
+ *   InstallerUrl pointing to GitHub → rewritten to /github.com/... on this worker
  *
  * Usage as a winget custom source:
  *   winget source add --name winget-cn \
@@ -21,8 +23,13 @@
 
 const UPSTREAM_BASE = "https://cdn.winget.microsoft.com";
 
-// GitHub domains to rewrite inside manifest YAML InstallerUrl fields
-const GH_PROXY = "https://gh.cn.lihongjie.cn";
+// GitHub domains proxied through this worker (path prefix → upstream base URL)
+const GITHUB_UPSTREAM: Record<string, string> = {
+  "github.com":                  "https://github.com",
+  "objects.githubusercontent.com": "https://objects.githubusercontent.com",
+  "raw.githubusercontent.com":   "https://raw.githubusercontent.com",
+  "codeload.github.com":         "https://codeload.github.com",
+};
 
 const HOP_BY_HOP = new Set([
   "host", "connection", "keep-alive", "proxy-authenticate",
@@ -47,30 +54,41 @@ function buildResponseHeaders(incoming: Headers): Headers {
 }
 
 /**
- * Rewrite GitHub download URLs in manifest YAML content to go through the proxy.
- * This accelerates installer downloads for Chinese users.
+ * Rewrite GitHub download URLs in manifest YAML to go through this worker.
+ * The proxy base is the same host the request came in on, so no external dependency.
  */
-function rewriteManifestUrls(yaml: string): string {
+function rewriteManifestUrls(yaml: string, proxyBase: string): string {
   return yaml
-    // GitHub release downloads and raw content
-    .replaceAll("https://github.com/", `${GH_PROXY}/`)
-    .replaceAll("https://raw.githubusercontent.com/", `${GH_PROXY}/raw/`)
-    .replaceAll("https://objects.githubusercontent.com/", `${GH_PROXY}/objects/`)
-    .replaceAll("https://codeload.github.com/", `${GH_PROXY}/codeload/`);
+    .replaceAll("https://github.com/",                  `${proxyBase}/github.com/`)
+    .replaceAll("https://objects.githubusercontent.com/", `${proxyBase}/objects.githubusercontent.com/`)
+    .replaceAll("https://raw.githubusercontent.com/",   `${proxyBase}/raw.githubusercontent.com/`)
+    .replaceAll("https://codeload.github.com/",         `${proxyBase}/codeload.github.com/`);
+}
+
+/**
+ * If the path starts with a known GitHub host prefix (e.g. /github.com/...),
+ * return the upstream URL to proxy to. Otherwise return null.
+ */
+function getGithubUpstream(pathname: string): string | null {
+  for (const [host, base] of Object.entries(GITHUB_UPSTREAM)) {
+    const prefix = `/${host}/`;
+    if (pathname.startsWith(prefix)) {
+      return `${base}${pathname.slice(prefix.length - 1)}`; // keep leading /
+    }
+  }
+  return null;
 }
 
 /**
  * Determine if a path is a V1 manifest file (the merged YAML served per package version).
- * Pattern: /manifests/{letter}/{Publisher}/{Package}/{Version}/{4char_hash}
+ * Pattern: /cache/manifests/{letter}/{Publisher}/{Package}/{Version}/{4char_hash}
  * These are small text files (few KB) safe to buffer and rewrite.
  */
 function isManifestPath(pathname: string): boolean {
-  // Match paths like /cache/manifests/g/Git/Git/2.54.0/1e1a
-  // The last segment is a short hex string (typically 4 chars)
   return pathname.includes("/manifests/");
 }
 
-async function proxyRequest(request: Request, targetUrl: string): Promise<Response> {
+async function proxyRequest(request: Request, targetUrl: string, proxyBase: string): Promise<Response> {
   const reqHeaders = buildRequestHeaders(request.headers);
 
   const upstreamReq = new Request(targetUrl, {
@@ -92,7 +110,7 @@ async function proxyRequest(request: Request, targetUrl: string): Promise<Respon
   const contentType = upstream.headers.get("content-type") ?? "";
   const pathname = new URL(targetUrl).pathname;
 
-  // For manifest YAML files: buffer and rewrite installer URLs
+  // For manifest YAML files: buffer and rewrite installer URLs to go through this worker
   if (
     upstream.ok &&
     request.method === "GET" &&
@@ -102,7 +120,7 @@ async function proxyRequest(request: Request, targetUrl: string): Promise<Respon
     const text = await upstream.text();
     // Only rewrite if it looks like a winget manifest YAML
     if (text.includes("InstallerUrl:") || text.includes("ManifestType:")) {
-      const rewritten = rewriteManifestUrls(text);
+      const rewritten = rewriteManifestUrls(text, proxyBase);
       // Update content-length since rewriting changes size
       respHeaders.set("content-length", String(new TextEncoder().encode(rewritten).byteLength));
       return new Response(rewritten, {
@@ -120,7 +138,7 @@ async function proxyRequest(request: Request, targetUrl: string): Promise<Respon
   });
 }
 
-function landingPage(_origin: string): Response {
+function landingPage(): Response {
   const intlHost = "winget.lihongjie.cn";
   const cnHost = "winget.cn.lihongjie.cn";
 
@@ -237,6 +255,47 @@ winget install Mozilla.Firefox --source winget-cn</pre>
     </div>
   </div>
 
+  <!-- Set as default -->
+  <div class="card">
+    <h2>⭐ 设为默认源（替换官方源）</h2>
+    <p style="color:var(--muted);font-size:.875rem;margin-bottom:1rem;">将官方 <code>winget</code> 源替换为镜像源后，无需加 <code>--source</code> 参数即可走代理加速。</p>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <p>移除官方默认源：</p>
+          <div class="code-block">
+            <pre>winget source remove --name winget</pre>
+            <button class="btn sm ghost" onclick="copyBlock(this)">复制</button>
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <p>以相同名称添加镜像源：</p>
+          <div class="code-block">
+            <pre>winget source add --name winget --arg https://${cnHost}/cache --type Microsoft.PreIndexed.Package</pre>
+            <button class="btn sm ghost" onclick="copyBlock(this)">复制</button>
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <p>之后所有安装命令无需指定 <code>--source</code>：</p>
+          <div class="code-block">
+            <pre>winget install Git.Git
+winget install Mozilla.Firefox
+winget upgrade --all</pre>
+            <button class="btn sm ghost" onclick="copyBlock(this)">复制</button>
+          </div>
+          <p class="note">⚠️ 恢复官方源：<code>winget source reset --force</code></p>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Route table -->
   <div class="card">
     <h2>📡 代理路径</h2>
@@ -246,7 +305,10 @@ winget install Mozilla.Firefox --source winget-cn</pre>
         <tr><td><code>/cache/source.msix</code></td><td><code>cdn.winget.microsoft.com</code></td><td>完整包索引下载（透明代理）</td></tr>
         <tr><td><code>/cache/source2.msix</code></td><td><code>cdn.winget.microsoft.com</code></td><td>增量包索引下载（透明代理）</td></tr>
         <tr><td><code>/cache/manifests/**</code></td><td><code>cdn.winget.microsoft.com</code></td><td>包清单 YAML（InstallerUrl 重写加速）</td></tr>
-        <tr><td><code>/fonts/*</code></td><td><code>cdn.winget.microsoft.com</code></td><td>字体源（透明代理）</td></tr>
+        <tr><td><code>/github.com/**</code></td><td><code>github.com</code></td><td>GitHub Release 安装器下载</td></tr>
+        <tr><td><code>/objects.githubusercontent.com/**</code></td><td><code>objects.githubusercontent.com</code></td><td>GitHub 对象存储下载</td></tr>
+        <tr><td><code>/raw.githubusercontent.com/**</code></td><td><code>raw.githubusercontent.com</code></td><td>GitHub Raw 文件</td></tr>
+        <tr><td><code>/codeload.github.com/**</code></td><td><code>codeload.github.com</code></td><td>GitHub 代码包下载</td></tr>
       </tbody>
     </table>
   </div>
@@ -275,15 +337,22 @@ export default {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const { pathname, search } = url;
-    const origin = `${url.protocol}//${url.host}`;
 
     // Landing page
     if (pathname === "/" || pathname === "") {
-      return landingPage(origin);
+      return landingPage();
     }
 
-    // Everything else: proxy to upstream CDN
+    const proxyBase = `${url.protocol}//${url.host}`;
+
+    // GitHub download proxy: /github.com/**, /objects.githubusercontent.com/**, etc.
+    const githubTarget = getGithubUpstream(pathname);
+    if (githubTarget) {
+      return proxyRequest(request, `${githubTarget}${search}`, proxyBase);
+    }
+
+    // Everything else: proxy to upstream winget CDN
     const targetUrl = `${UPSTREAM_BASE}${pathname}${search}`;
-    return proxyRequest(request, targetUrl);
+    return proxyRequest(request, targetUrl, proxyBase);
   },
 };

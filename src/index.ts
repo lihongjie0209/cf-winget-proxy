@@ -201,11 +201,13 @@ async function handleManifestSearch(
   }
 
   const filters: any[] = body?.Filters ?? [];
+  const inclusions: any[] = body?.Inclusions ?? [];
   const query = body?.Query;
   const maxResults: number = body?.MaximumResults ?? 20;
 
-  // ── Case 1: exact PackageIdentifier filter ────────────────────────────────
-  const exactIdFilter = filters.find(
+  // ── Case 1: exact PackageIdentifier match (winget uses Inclusions for `winget install`)
+  const allCriteria = [...filters, ...inclusions];
+  const exactIdFilter = allCriteria.find(
     (f) =>
       f.PackageMatchField === "PackageIdentifier" &&
       f.RequestMatch?.MatchType === "Exact"

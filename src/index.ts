@@ -28,9 +28,8 @@ import * as jsyaml from "js-yaml";
 
 const UPSTREAM_CDN = "https://cdn.winget.microsoft.com";
 const WINGET_PKGS_API = "https://api.github.com/repos/microsoft/winget-pkgs";
-// YAML manifest files are fetched from Microsoft CDN (same path structure as GitHub repo,
-// no GitHub API rate limits, more reliable for China)
-const WINGET_PKGS_MANIFEST_BASE = "https://cdn.winget.microsoft.com/cache";
+// YAML manifest files: raw.githubusercontent.com (not subject to api.github.com rate limits)
+const WINGET_PKGS_MANIFEST_BASE = "https://raw.githubusercontent.com/microsoft/winget-pkgs/master";
 
 // Domain-like path prefix: /download.example.com/path  (requires at least one dot)
 const DOMAIN_PREFIX_RE = /^\/([a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9][a-zA-Z0-9-]*)+)(\/.*)?$/;
